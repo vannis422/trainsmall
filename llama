@@ -1,1 +1,194 @@
+# 安装必要依赖（使用transformers最新版）
+!pip install -q git+https://github.com/huggingface/transformers.git
+!pip install -q accelerate bitsandbytes
 
+# 检查GPU资源
+import torch
+print(f"GPU可用: {torch.cuda.is_available()}")
+print(f"GPU型号: {torch.cuda.get_device_name(0)}")
+print(f"显存: {torch.cuda.get_device_properties(0).total_memory/1024**3:.2f}GB")
+
+from huggingface_hub import snapshot_download
+
+# 下载模型（需要先登录HuggingFace）
+from huggingface_hub import login
+login("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")
+
+# 下载Llama3-2.1B模型
+model_path = snapshot_download(
+    "meta-llama/Llama-3.2-1B",
+    revision="main",
+    ignore_patterns=["*.bin", "*.gguf"],  # 不下载原始权重，后面会量化
+    local_dir="/content/Llama3-2.1B"
+)
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+import torch
+
+# 4-bit量化配置
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.bfloat16
+)
+
+# 加载并量化模型
+model = AutoModelForCausalLM.from_pretrained(
+    "/content/Llama3-2.1B",
+    quantization_config=bnb_config,
+    device_map="auto",
+    torch_dtype=torch.bfloat16
+)
+
+tokenizer = AutoTokenizer.from_pretrained("/content/Llama3-2.1B")
+
+# 保存量化后的模型
+quant_path = "/content/Llama3-2.1B-4bit"
+model.save_pretrained(quant_path)
+tokenizer.save_pretrained(quant_path)
+
+!pip install -q peft transformers accelerate bitsandbytes datasets evaluate
+
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding
+)
+import torch
+from sklearn.metrics import accuracy_score
+import numpy as np
+from datasets import load_dataset
+
+# 1. 載入數據集
+dataset = load_dataset("pubmed_qa", "pqa_labeled")["train"]
+dataset = dataset.train_test_split(test_size=0.2, seed=42)
+train_val_dataset = dataset["train"]
+test_dataset = dataset["test"]
+train_val_split = train_val_dataset.train_test_split(test_size=0.125, seed=42)
+train_dataset = train_val_split["train"]
+val_dataset = train_val_split["test"]
+
+# 2. 設置標籤映射
+label2id = {"yes": 0, "no": 1, "maybe": 2}
+id2label = {v: k for k, v in label2id.items()}
+
+# 3. 載入tokenizer並正確設置pad token
+tokenizer = AutoTokenizer.from_pretrained("/content/Llama3-2.1B-4bit")
+
+# 重要修正：確保pad token設置正確
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+# 同时需要更新模型配置
+if hasattr(tokenizer, 'pad_token_id'):
+  model.config.pad_token_id = tokenizer.pad_token_id
+
+# 4. 數據預處理（修正版）
+def preprocess(examples):
+    prompts = [
+        f"Question: {q}\nContext: {c}\nAnswer:"
+        for q, c in zip(examples["question"], examples["context"])
+    ]
+    encodings = tokenizer(
+        prompts,
+        truncation=True,
+        padding=False,  # 改為False，由DataCollator處理
+        max_length=512,
+        return_tensors=None  # 返回普通字典而非tensors
+    )
+    encodings["labels"] = [label2id[label] for label in examples["final_decision"]]
+    return encodings
+
+# 應用預處理
+train_dataset = train_dataset.map(preprocess, batched=True, remove_columns=train_dataset.column_names)
+val_dataset = val_dataset.map(preprocess, batched=True, remove_columns=val_dataset.column_names)
+test_dataset = test_dataset.map(preprocess, batched=True, remove_columns=test_dataset.column_names)
+
+# 5. 創建數據收集器（處理padding）
+data_collator = DataCollatorWithPadding(
+    tokenizer=tokenizer,
+    padding="longest",
+    max_length=512,
+    pad_to_multiple_of=8,
+    return_tensors="pt"
+)
+
+# 6. 載入量化模型（不再傳入quantization_config）
+model = AutoModelForSequenceClassification.from_pretrained(
+    "/content/Llama3-2.1B-4bit",
+    num_labels=3,
+    id2label=id2label,
+    label2id=label2id,
+    device_map="auto"
+)
+# 关键修正：确保模型配置有pad_token_id
+if model.config.pad_token_id is None:
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+# 7. 準備模型進行k-bit訓練
+model = prepare_model_for_kbit_training(model)
+
+# 8. 配置LoRA參數
+peft_config = LoraConfig(
+    r=8,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="SEQ_CLS",
+    target_modules=["q_proj", "v_proj"],
+    modules_to_save=[""]  # 確保分類頭也被訓練
+)
+
+# 9. 添加LoRA適配器
+model = get_peft_model(model, peft_config)
+model.print_trainable_parameters()
+
+# 10. 修正訓練參數（使用正確的參數名稱）(用pytorch操作)
+training_args = TrainingArguments(
+    output_dir="./results",
+    eval_strategy="epoch",  # 正確的參數名稱
+    save_strategy="epoch",
+    learning_rate=1e-4,
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    num_train_epochs=5,
+    weight_decay=0.01,
+    fp16=True,
+    gradient_accumulation_steps=4,
+    report_to="none",
+    save_total_limit=3,
+    gradient_checkpointing=True,
+    remove_unused_columns=False,
+    label_names=["labels"]
+)
+
+# 11. 評估指標
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=-1)
+    return {"accuracy": accuracy_score(labels, predictions)}
+
+# 12. 初始化Trainer(改成pytorch)
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+)
+
+# 13. 開始訓練
+trainer.train()
+
+
+# 14. 評估模型
+val_result = trainer.evaluate()
+print(f"\nValidation Accuracy: {val_result['eval_accuracy']:.2%}")
+
+test_result = trainer.evaluate(eval_dataset=test_dataset)
+print(f"\nTest Accuracy: {test_result['eval_accuracy']:.2%}")
